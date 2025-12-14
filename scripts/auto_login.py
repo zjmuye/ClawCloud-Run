@@ -4,8 +4,6 @@ ClawCloud 自动登录脚本
 - 等待设备验证批准（30秒）
 - 每次登录后自动更新 Cookie
 - Telegram 通知
-- 截图直接发送，不保存文件
-- 日志不暴露 Cookie
 """
 
 import os
@@ -41,17 +39,17 @@ class Telegram:
         except:
             pass
     
-    def photo(self, data, caption=""):
-        """发送截图（字节数据）"""
-        if not self.ok or not data:
+    def photo(self, path, caption=""):
+        if not self.ok or not os.path.exists(path):
             return
         try:
-            requests.post(
-                f"https://api.telegram.org/bot{self.token}/sendPhoto",
-                data={"chat_id": self.chat_id, "caption": caption[:1024]},
-                files={"photo": ("screenshot.png", data, "image/png")},
-                timeout=60
-            )
+            with open(path, 'rb') as f:
+                requests.post(
+                    f"https://api.telegram.org/bot{self.token}/sendPhoto",
+                    data={"chat_id": self.chat_id, "caption": caption[:1024]},
+                    files={"photo": f},
+                    timeout=60
+                )
         except:
             pass
 
@@ -79,6 +77,7 @@ class SecretUpdater:
                 "Accept": "application/vnd.github.v3+json"
             }
             
+            # 获取公钥
             r = requests.get(
                 f"https://api.github.com/repos/{self.repo}/actions/secrets/public-key",
                 headers=headers, timeout=30
@@ -90,6 +89,7 @@ class SecretUpdater:
             pk = public.PublicKey(key_data['key'].encode(), encoding.Base64Encoder())
             encrypted = public.SealedBox(pk).encrypt(value.encode())
             
+            # 更新 Secret
             r = requests.put(
                 f"https://api.github.com/repos/{self.repo}/actions/secrets/{name}",
                 headers=headers,
@@ -111,8 +111,9 @@ class AutoLogin:
         self.gh_session = os.environ.get('GH_SESSION', '').strip()
         self.tg = Telegram()
         self.secret = SecretUpdater()
+        self.shots = []
         self.logs = []
-        self.last_shot = None  # 最后一张截图的字节数据
+        self.n = 0
         
     def log(self, msg, level="INFO"):
         icons = {"INFO": "ℹ️", "SUCCESS": "✅", "ERROR": "❌", "WARN": "⚠️", "STEP": "🔹"}
@@ -121,17 +122,14 @@ class AutoLogin:
         self.logs.append(line)
     
     def shot(self, page, name):
-        """截图保存到内存"""
+        self.n += 1
+        f = f"{self.n:02d}_{name}.png"
         try:
-            self.last_shot = page.screenshot()
-            self.log(f"截图: {name}")
+            page.screenshot(path=f)
+            self.shots.append(f)
         except:
             pass
-    
-    def send_shot(self, caption=""):
-        """发送最后一张截图"""
-        if self.last_shot:
-            self.tg.photo(self.last_shot, caption)
+        return f
     
     def click(self, page, sels, desc=""):
         for s in sels:
@@ -145,14 +143,6 @@ class AutoLogin:
                 pass
         return False
     
-    def click_github(self, page):
-        """点击 GitHub 登录按钮"""
-        return self.click(page, [
-            'button:has-text("GitHub")',
-            'a:has-text("GitHub")',
-            '[data-provider="github"]'
-        ], "GitHub")
-    
     def get_session(self, context):
         """提取 Session Cookie"""
         try:
@@ -164,19 +154,22 @@ class AutoLogin:
         return None
     
     def save_cookie(self, value):
-        """保存新 Cookie（日志不显示内容）"""
+        """保存新 Cookie"""
         if not value:
             return
         
-        # 日志不暴露 Cookie 内容
-        self.log("已获取新 Cookie", "SUCCESS")
+        self.log(f"新 Cookie: {value[:15]}...{value[-8:]}", "SUCCESS")
         
+        # 自动更新 Secret
         if self.secret.update('GH_SESSION', value):
             self.log("已自动更新 GH_SESSION", "SUCCESS")
-            self.tg.send("🔑 <b>Cookie 已自动更新</b>")
+            self.tg.send("🔑 <b>Cookie 已自动更新</b>\n\nGH_SESSION 已保存")
         else:
-            # 只通过 Telegram 私发 Cookie
-            self.tg.send(f"🔑 <b>新 Cookie</b>\n\n请更新 <b>GH_SESSION</b>:\n<code>{value}</code>")
+            # 通过 Telegram 发送
+            self.tg.send(f"""🔑 <b>新 Cookie</b>
+
+请更新 Secret <b>GH_SESSION</b>:
+<code>{value}</code>""")
             self.log("已通过 Telegram 发送 Cookie", "SUCCESS")
     
     def wait_device(self, page):
@@ -190,14 +183,15 @@ class AutoLogin:
 1️⃣ 检查邮箱点击链接
 2️⃣ 或在 GitHub App 批准""")
         
-        self.send_shot("设备验证页面")
+        if self.shots:
+            self.tg.photo(self.shots[-1], "设备验证页面")
         
         for i in range(DEVICE_VERIFY_WAIT):
             time.sleep(1)
             if i % 5 == 0:
                 self.log(f"  等待... ({i}/{DEVICE_VERIFY_WAIT}秒)")
                 url = page.url
-                if 'verified-device' not in url and 'device-verification' not in url and 'sessions' not in url:
+                if 'verified-device' not in url and 'device-verification' not in url:
                     self.log("设备验证通过！", "SUCCESS")
                     self.tg.send("✅ <b>设备验证通过</b>")
                     return True
@@ -207,7 +201,7 @@ class AutoLogin:
                 except:
                     pass
         
-        if 'verified-device' not in page.url and 'sessions' not in page.url:
+        if 'verified-device' not in page.url:
             return True
         
         self.log("设备验证超时", "ERROR")
@@ -242,19 +236,17 @@ class AutoLogin:
         self.log(f"当前: {url}")
         
         # 设备验证
-        if 'verified-device' in url or 'device-verification' in url or 'sessions' in url:
+        if 'verified-device' in url or 'device-verification' in url:
             if not self.wait_device(page):
                 return False
             time.sleep(2)
             page.wait_for_load_state('networkidle', timeout=30000)
             self.shot(page, "验证后")
-            self.log(f"验证后页面: {page.url}")
         
         # 2FA
         if 'two-factor' in page.url:
             self.log("需要两步验证！", "ERROR")
             self.tg.send("❌ <b>需要两步验证</b>")
-            self.send_shot("需要两步验证")
             return False
         
         # 错误
@@ -282,37 +274,14 @@ class AutoLogin:
         self.log("等待重定向...", "STEP")
         for i in range(wait):
             url = page.url
-            
-            # 成功
             if 'claw.cloud' in url and 'signin' not in url.lower():
                 self.log("重定向成功！", "SUCCESS")
                 return True
-            
-            # 在 ClawCloud 登录页，需要再次点击 GitHub
-            if 'claw.cloud' in url and 'signin' in url.lower():
-                self.log("在登录页，点击 GitHub...", "WARN")
-                self.shot(page, "signin_retry")
-                if self.click_github(page):
-                    time.sleep(3)
-                    page.wait_for_load_state('networkidle', timeout=30000)
-                continue
-            
-            # OAuth 授权页
             if 'github.com/login/oauth/authorize' in url:
                 self.oauth(page)
-                continue
-            
-            # GitHub 首页
-            if url in ['https://github.com/', 'https://github.com']:
-                self.log("在 GitHub 首页，返回 ClawCloud...", "WARN")
-                page.goto(SIGNIN_URL, timeout=30000)
-                page.wait_for_load_state('networkidle', timeout=30000)
-                continue
-            
             time.sleep(1)
             if i % 10 == 0:
                 self.log(f"  等待... ({i}秒)")
-        
         self.log("重定向超时", "ERROR")
         return False
     
@@ -345,7 +314,13 @@ class AutoLogin:
         msg += "\n\n<b>日志:</b>\n" + "\n".join(self.logs[-6:])
         
         self.tg.send(msg)
-        self.send_shot("最终截图" if ok else "错误截图")
+        
+        if self.shots:
+            if not ok:
+                for s in self.shots[-3:]:
+                    self.tg.photo(s, s)
+            else:
+                self.tg.photo(self.shots[-1], "完成")
     
     def run(self):
         print("\n" + "="*50)
@@ -391,6 +366,7 @@ class AutoLogin:
                 if 'signin' not in page.url.lower():
                     self.log("已登录！", "SUCCESS")
                     self.keepalive(page)
+                    # 提取并保存新 Cookie
                     new = self.get_session(context)
                     if new:
                         self.save_cookie(new)
@@ -400,9 +376,12 @@ class AutoLogin:
                 
                 # 2. 点击 GitHub
                 self.log("步骤2: 点击 GitHub", "STEP")
-                if not self.click_github(page):
+                if not self.click(page, [
+                    'button:has-text("GitHub")',
+                    'a:has-text("GitHub")',
+                    '[data-provider="github"]'
+                ], "GitHub"):
                     self.log("找不到按钮", "ERROR")
-                    self.shot(page, "找不到按钮")
                     self.notify(False, "找不到 GitHub 按钮")
                     sys.exit(1)
                 
@@ -443,7 +422,7 @@ class AutoLogin:
                 # 6. 保活
                 self.keepalive(page)
                 
-                # 7. 更新 Cookie
+                # 7. 提取并保存新 Cookie
                 self.log("步骤6: 更新 Cookie", "STEP")
                 new = self.get_session(context)
                 if new:
